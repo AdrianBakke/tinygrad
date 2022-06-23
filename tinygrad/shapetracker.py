@@ -57,10 +57,8 @@ class ZeroView:
 
 @functools.lru_cache(maxsize=None)
 def strides_for_shape(shape):
-  strides = [1]
-  for d in shape[::-1][:-1]:
-    strides = [d*strides[0]] + strides
-  return tuple(strides)
+  X = list(shape)[1:] + [1,1]
+  return tuple(X[i]*X[i+1] for i in range(len(X)-1))
 
 @functools.lru_cache(maxsize=None)
 def view_from_shape(shape:Tuple):
