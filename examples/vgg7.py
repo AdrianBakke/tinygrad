@@ -1,6 +1,6 @@
 from PIL import Image
 from tinygrad.tensor import Tensor
-from tinygrad.optim import SGD
+from tinygrad.nn.optim import SGD
 import examples.yolo.waifu2x
 from examples.yolo.kinne import KinneDir
 import sys
@@ -158,7 +158,7 @@ elif cmd == "train":
     sample_y = Tensor(y_img, requires_grad = False)
 
     # magic code roughly from readme example
-    # An explaination, in case anyone else has to go down this path:
+    # An explanation, in case anyone else has to go down this path:
     # This runs the actual network normally
     out = vgg7.forward(sample_x)
     # Subtraction determines error here (as this is an image, not classification).
