@@ -1,7 +1,12 @@
+from __future__ import annotations
+
+from typing import List, Optional, Set, Tuple, Union
 import numpy as np
 from functools import lru_cache
+from tinygrad.ops import BinaryOps, MovementOps, ReduceOps, UnaryOps
+from tinygrad.shapetracker import ShapeTracker
 from tinygrad.tensor import Function
-from tinygrad.helpers import binary_broadcast
+from tinygrad.helpers import ConvArgs, binary_broadcast, prod
 
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
@@ -51,6 +56,82 @@ def get_block_grid(shape=None, nelem=None):
   block = (int([nelem, MAX_THREADS_BLOCK][int(nelem > MAX_THREADS_BLOCK)]), 1, 1)
   grid = (int(1+(nelem-1)//MAX_THREADS_BLOCK), 1)
   return block, grid
+
+
+  # ************* new ops *************
+class GPUBuffer:
+  code_for_op = {
+    UnaryOps.NOOP: "(A)", UnaryOps.NEG: "(-(A))", UnaryOps.RELU: "max(A, (float)0.)",
+    UnaryOps.EXP: "exp(A)", UnaryOps.LOG: "log(A)", UnaryOps.SIGN: "sign(A)", UnaryOps.RECIPROCAL: "((float)1.0/A)",
+    BinaryOps.ADD: "(A+B)", BinaryOps.SUB: "(A-B)", BinaryOps.MUL: "(A*B)",
+    BinaryOps.DIV: "(A/B)", BinaryOps.POW: "pow(A,B)", BinaryOps.CMPEQ: "(A==B)",
+    ReduceOps.SUM: "(acc + A)", ReduceOps.MAX: "max(A, acc)"
+  }
+  start_for_op = {ReduceOps.SUM: "0.0", ReduceOps.MAX: "-INFINITY"}
+
+  def __init__(self, shape:Union[ShapeTracker, Tuple[int, ...]], hostbuf:Optional[GPUBuffer]=None, backing:Optional[np.ndarray]=None):
+    self.st = shape if isinstance(shape, ShapeTracker) else ShapeTracker(tuple(shape))
+    self.shape = self.st.shape
+    self._buf : Optional[CudaBuffer] = hostbuf._buf if hostbuf is not None else None
+    self._base_shape : Tuple[int, ...] = hostbuf._base_shape if hostbuf is not None else self.shape
+    self._backing : Optional[np.ndarray] = hostbuf._backing if hostbuf is not None else backing
+    # early copy in for large buffers
+    if self._backing is not None and self._backing.shape != (1,):
+      self.cl
+  def unary_op(x, op:UnaryOps): return type(x)(x.shape)._processing_op([("A", x)], CudaBuffer.code_for_op[op])
+  def binary_op(x, op:BinaryOps, y:CudaBuffer): return type(x)(x.shape)._processing_op([("A", x), ("B", y)], CudaBuffer.code_for_op[op])
+  def contiguous_op(x): return x if x.st.contiguous else x.unary_op(UnaryOps.NOOP)
+  def movement_op(x, op:MovementOps, arg) -> CudaBuffer: return type(x)(ShapeTracker(x.st).movement_op(op, arg), x)
+  def reduce_op(x, op:ReduceOps, new_shape:Tuple[int, ...]): return type(x)(new_shape)._processing_op([("A", x)], code="acc", earlycode=CudaBuffer.code_for_op[op], earlybufs=set("A"), op=op)
+
+  def _processing_op(ret, bufs: List[Tuple[str, CudaBuffer]]=[], code:str="acc", C:Optional[ConvArgs]=None, op=ReduceOps.SUM, reduce_shape=None, earlybufs:Set[str]=set(), earlycode:str="acc") -> CudaBuffer:
+    assert C is None
+
+    # get the input/output shape and the reduce amount
+    reduce_shape = (bufs[0][1].shape, ret.shape) if reduce_shape is None else reduce_shape
+    red = prod([s for s,n in zip(*reduce_shape) if n == 1])
+    assert red < 2**31, f"reduce must be under 2**31, {red} isn't"
+
+    # if it's a partial reduce, assert last non reduced axis is before the first reduced axis
+    if red > 1 and prod(ret.shape) != 1:
+      assert max([i for i,(s,n) in enumerate(zip(*reduce_shape)) if s == n and n != 1]) < min([i for i,(s,n) in enumerate(zip(*reduce_shape)) if s != 1 and n == 1])
+
+    kernel_name = "reduce" if red > 1 else "elementwise"
+    early_views = {name:buf.contiguous_view_constant_fold(name, red) for name, buf in bufs if name in earlybufs}
+    late_views = {name:buf.contiguous_view_constant_fold(name) for name, buf in bufs if name not in earlybufs}
+    views = {**early_views, **late_views}
+
+    buf_types : List[str] = [views[name][1] for name, _ in bufs if views[name][1] is not None]  # type: ignore
+    buf_cl = [buf.cl if 'image2d_t' not in views[name][1] else buf.image for name, buf in bufs if views[name][1] is not None]  # type: ignore
+
+    # use local memory if it's a multistage reduce
+    inter_red = 256 if (prod(ret.shape) < 8192 and red >= 256) else 1
+    if inter_red > 1:
+      buf_cl.append(cl.LocalMemory(inter_red*4))
+
+    reduce_loop = f"int mid = get_global_id(1); for (int subidx = {red//inter_red + 1} * mid; subidx < min({red}, {red//inter_red + 1} * (mid+1)); subidx++)" if inter_red > 1 else f"for (int subidx = 0; subidx < {red}; subidx++)"
+    conv_prg = CLProgram(kernel_name, f"""{chr(10).join([x[0] for x in views.values()])}
+    __kernel void {kernel_name}({','.join(["__global float* restrict output"] + buf_types + (["__local float *temp"] if inter_red > 1 else []))}) {{
+      const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
+      float acc = {CudaBuffer.start_for_op[op]};
+      int gid = get_global_id(0);
+      {reduce_loop} {{
+  {chr(10).join([f'        float {name} = ' + early_views[name][2] for name in early_views])}
+        acc = {earlycode};
+      }}"""+(f"""
+      temp[mid] = acc; barrier(CLK_LOCAL_MEM_FENCE);
+      if (mid == 0) {{ acc = {CudaBuffer.start_for_op[op]};
+        for (int rdx = 0; rdx < {inter_red}; rdx++) {{
+          acc = {CudaBuffer.code_for_op[op].replace('A', 'temp[rdx]')};
+        }}""" if inter_red != 1 else "{")+f"""
+  {chr(10).join([f'        float {name} = ' + late_views[name][2] for name in late_views])}
+        output[gid] = {code};
+      }}
+    }}""")
+
+    conv_prg([prod(ret.shape), inter_red, 1], [1, inter_red, 1] if inter_red > 1 else None, ret.cl, *buf_cl, op_estimate=prod(reduce_shape[0])*len(earlybufs) + prod(reduce_shape[1])*len(bufs))
+    return ret
+
 
 # ************* unary ops *************
 
