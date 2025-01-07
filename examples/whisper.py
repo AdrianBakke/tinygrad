@@ -21,7 +21,7 @@ class MultiHeadAttention:
     self.kv_caching = kv_caching
     self.max_self_attn_cache_len = max_self_attn_cache_len
 
-  def __call__(self, x:Tensor, xa:Optional[Tensor]=None, mask:Optional[Tensor]=None, len: Union[Variable,int]=None):
+  def __call__(self, x:Tensor, xa:Tensor|None=None, mask:Tensor|None=None, len: int|None=None):
     if self.kv_caching == 'cross':
       if xa is not None:
         k, v = self.key(xa), self.value(xa)
@@ -94,11 +94,14 @@ class AudioEncoder:
 class TextDecoder:
   def __init__(self, n_vocab, n_text_ctx, n_text_state, n_text_head, n_text_layer, **_):
     self.max_tokens_to_sample = n_text_ctx // 2
-    self.max_self_attn_cache_len = self.max_tokens_to_sample * 2 + 5  # roughly prompt + start toks + max_tokens_to_sample
+    #self.max_self_attn_cache_len = self.max_tokens_to_sample * 2 + 5  # roughly prompt + start toks + max_tokens_to_sample
+    # self.max_self_attn_cache_len = self.max_tokens_to_sample * 2 + 5  # roughly prompt + start toks + max_tokens_to_sample
+    self.max_self_attn_cache_len = min(n_text_ctx, self.max_tokens_to_sample * 2 + 5)  # Ensure it stays within n_text_ctx
 
     self.token_embedding = nn.Embedding(n_vocab, n_text_state)
     self.positional_embedding = Tensor.empty(n_text_ctx, n_text_state)
-    self.blocks = [ResidualAttentionBlock(n_text_state, n_text_head, is_decoder_block=True, max_self_attn_cache_len=self.max_self_attn_cache_len) for _ in range(n_text_layer)]
+    self.blocks = [ResidualAttentionBlock(n_text_state, n_text_head, is_decoder_block=True, max_self_attn_cache_len=self.max_self_attn_cache_len)
+                   for _ in range(n_text_layer)]
     self.ln = nn.LayerNorm(n_text_state)
     self.mask = Tensor.full((n_text_ctx, n_text_ctx), -np.inf).triu(1).realize()
     self.getjitted = collections.defaultdict(lambda: TinyJit(self.forward))
@@ -140,14 +143,12 @@ def prep_audio(waveforms: List[np.ndarray], batch_size: int, truncate=False) -> 
   :param truncate: If true, truncates (or pads) audio to exactly 30s for a single encoder pass
   :return: mel spectrogram of the given waveforms
   """
+  waveforms = [w[:SAMPLES_PER_SEGMENT] for w in waveforms]
   def pad_or_trim(arr, target_len):
     curr_len = len(arr)
-    if curr_len == target_len:
-      return arr
-    elif curr_len < target_len:
-      return np.pad(arr, (0, target_len - curr_len), 'constant')
-    else:
-      return arr[:target_len]
+    if curr_len == target_len: return arr
+    elif curr_len < target_len: return np.pad(arr, (0, target_len - curr_len), 'constant')
+    else: return arr[:target_len]
 
   max_len = SAMPLES_PER_SEGMENT if truncate else max(len(wav) for wav in waveforms)
   if (r := max_len % SAMPLES_PER_SEGMENT) > 0: max_len += SAMPLES_PER_SEGMENT - r
@@ -168,16 +169,19 @@ def prep_audio(waveforms: List[np.ndarray], batch_size: int, truncate=False) -> 
   return log_spec
 
 LANGUAGES = {
-  "en": "english", "zh": "chinese", "de": "german", "es": "spanish", "ru": "russian", "ko": "korean", "fr": "french", "ja": "japanese", "pt": "portuguese", "tr": "turkish",
-  "pl": "polish", "ca": "catalan", "nl": "dutch", "ar": "arabic", "sv": "swedish", "it": "italian", "id": "indonesian", "hi": "hindi", "fi": "finnish", "vi": "vietnamese",
-  "he": "hebrew", "uk": "ukrainian", "el": "greek", "ms": "malay", "cs": "czech", "ro": "romanian", "da": "danish", "hu": "hungarian", "ta": "tamil", "no": "norwegian",
-  "th": "thai", "ur": "urdu", "hr": "croatian", "bg": "bulgarian", "lt": "lithuanian", "la": "latin", "mi": "maori", "ml": "malayalam", "cy": "welsh", "sk": "slovak", "te": "telugu",
-  "fa": "persian", "lv": "latvian", "bn": "bengali", "sr": "serbian", "az": "azerbaijani", "sl": "slovenian", "kn": "kannada", "et": "estonian", "mk": "macedonian",
-  "br": "breton", "eu": "basque", "is": "icelandic", "hy": "armenian", "ne": "nepali", "mn": "mongolian", "bs": "bosnian", "kk": "kazakh", "sq": "albanian", "sw": "swahili",
-  "gl": "galician", "mr": "marathi", "pa": "punjabi", "si": "sinhala", "km": "khmer", "sn": "shona", "yo": "yoruba", "so": "somali", "af": "afrikaans", "oc": "occitan", "ka": "georgian",
-  "be": "belarusian", "tg": "tajik", "sd": "sindhi", "gu": "gujarati", "am": "amharic", "yi": "yiddish", "lo": "lao", "uz": "uzbek", "fo": "faroese", "ht": "haitian creole",
-  "ps": "pashto", "tk": "turkmen", "nn": "nynorsk", "mt": "maltese", "sa": "sanskrit", "lb": "luxembourgish", "my": "myanmar", "bo": "tibetan", "tl": "tagalog", "mg": "malagasy",
-  "as": "assamese", "tt": "tatar", "haw": "hawaiian", "ln": "lingala", "ha": "hausa", "ba": "bashkir", "jw": "javanese", "su": "sundanese",
+  "en": "english", "zh": "chinese", "de": "german", "es": "spanish", "ru": "russian", "ko": "korean", "fr": "french", "ja": "japanese",
+  "pt": "portuguese", "tr": "turkish", "pl": "polish", "ca": "catalan", "nl": "dutch", "ar": "arabic", "sv": "swedish", "it": "italian",
+  "id": "indonesian", "hi": "hindi", "fi": "finnish", "vi": "vietnamese", "he": "hebrew", "uk": "ukrainian", "el": "greek", "ms": "malay",
+  "cs": "czech", "ro": "romanian", "da": "danish", "hu": "hungarian", "ta": "tamil", "no": "norwegian", "th": "thai", "ur": "urdu", "hr": "croatian",
+  "bg": "bulgarian", "lt": "lithuanian", "la": "latin", "mi": "maori", "ml": "malayalam", "cy": "welsh", "sk": "slovak", "te": "telugu",
+  "fa": "persian", "lv": "latvian", "bn": "bengali", "sr": "serbian", "az": "azerbaijani", "sl": "slovenian", "kn": "kannada", "et": "estonian",
+  "mk": "macedonian", "br": "breton", "eu": "basque", "is": "icelandic", "hy": "armenian", "ne": "nepali", "mn": "mongolian", "bs": "bosnian",
+  "kk": "kazakh", "sq": "albanian", "sw": "swahili", "gl": "galician", "mr": "marathi", "pa": "punjabi", "si": "sinhala", "km": "khmer",
+  "sn": "shona", "yo": "yoruba", "so": "somali", "af": "afrikaans", "oc": "occitan", "ka": "georgian", "be": "belarusian", "tg": "tajik",
+  "sd": "sindhi", "gu": "gujarati", "am": "amharic", "yi": "yiddish", "lo": "lao", "uz": "uzbek", "fo": "faroese", "ht": "haitian creole",
+  "ps": "pashto", "tk": "turkmen", "nn": "nynorsk", "mt": "maltese", "sa": "sanskrit", "lb": "luxembourgish", "my": "myanmar", "bo": "tibetan",
+  "tl": "tagalog", "mg": "malagasy", "as": "assamese", "tt": "tatar", "haw": "hawaiian", "ln": "lingala", "ha": "hausa", "ba": "bashkir",
+  "jw": "javanese", "su": "sundanese",
 }
 
 def get_encoding(encoding_name):
@@ -229,12 +233,77 @@ def init_whisper(model_name="tiny.en", batch_size=1):
   enc = get_encoding("multilingual" if model.is_multilingual else "gpt2")
   return model, enc
 
-def load_file_waveform(filename):
-  waveform, _ = librosa.load(filename, sr=RATE)
-  return waveform
+def load_file_waveform(filename, chunk_size=SAMPLES_PER_SEGMENT):
+    """
+    Generator to load and yield chunks of waveform data from a file.
+    """
+    total_samples = int(librosa.get_duration(path=filename) * RATE)
+    for chunk_start in range(0, total_samples, chunk_size):
+        # Load a chunk of the waveform
+        waveform, _ = librosa.load(filename, sr=RATE, offset=chunk_start / RATE, duration=chunk_size / RATE)
+        yield waveform
 
-def transcribe_file(model, enc, filename):
-  return transcribe_waveform(model, enc, [load_file_waveform(filename)])
+def transcribe_file(model, enc, filename, output_file='transcription.txt'):
+    """
+    Transcribes audio from a file in chunks and writes the transcription to an output file.
+    """
+    for waveform_chunk in load_file_waveform(filename):
+      with open(output_file, 'a') as f:
+        print("new")
+        transcription = transcribe_waveform(model, enc, [waveform_chunk])
+        f.write(transcription + '\n')
+
+    return f"Transcriptions saved to {output_file}"
+# def load_file_waveform(filename):
+#   waveform, _ = librosa.load(filename, sr=RATE)
+#   return waveform
+
+# def transcribe_file(model, enc, filename):
+#   return transcribe_waveform(model, enc, [load_file_waveform(filename)])
+
+# import gc
+
+# def transcribe_waveform(model: Whisper, enc, waveforms, output_file='transcription.txt', truncate=False):
+#     """
+#     Transcribes audio waveforms, writing the output directly to a file to minimize memory usage.
+#     """
+#     #segment_duration = SAMPLES_PER_SEGMENT // 2  # Use smaller segments for reduced memory usage
+#     print(waveforms[0])
+#     print(len(waveforms))
+
+#     for waveform in waveforms:
+#       with open(output_file, 'a') as f:
+#         num_segments = (len(waveform) + SAMPLES_PER_SEGMENT - 1) // SAMPLES_PER_SEGMENT
+
+#         for i in range(num_segments):
+#             start = i * SAMPLES_PER_SEGMENT
+#             end = min((i + 1) * SAMPLES_PER_SEGMENT, len(waveform))
+#             segment = waveform[start:end]
+
+#             # Prepare the segment
+#             log_spec = prep_audio([segment], model.batch_size, truncate=True)
+#             encoded_audio = model.encoder.encode(Tensor(log_spec))
+
+#             # Transcribe the segment
+#             ctx = np.tile([enc._special_tokens["<|startoftranscript|>"], enc._special_tokens["<|notimestamps|>"]], (model.batch_size, 1))
+#             segment_transcription = []
+
+#             while True:
+#                 out = model.decoder(Tensor(ctx), 0, encoded_audio).realize()
+#                 next_tokens = out[:, -1].argmax(axis=-1).numpy().astype(np.int32).reshape(-1, 1)
+#                 ctx = np.concatenate((ctx, next_tokens), axis=1)
+
+#                 if (next_tokens == enc._special_tokens["<|endoftext|>"]).all() or len(ctx[0]) >= FRAMES_PER_SEGMENT:
+#                     break
+
+#             # Decode and write to file
+#             tokens = ctx[0, 2:]  # Skip the start tokens
+#             transcription = enc.decode(tokens).strip()
+#             f.write(transcription + '\n')
+
+#             # Clear intermediate variables to free memory
+#             del log_spec, encoded_audio, ctx, next_tokens
+#             gc.collect()  # Force garbage collection to free up memory
 
 def transcribe_waveform(model: Whisper, enc, waveforms, truncate=False):
   """
@@ -276,8 +345,9 @@ def transcribe_waveform(model: Whisper, enc, waveforms, truncate=False):
     else: ctx = [inferloop((np.array([c]*model.batch_size)), encoded_audio)[i] for i,c in enumerate(ctx)]
 
     for i, (res, arr) in enumerate(zip(transcriptions, ctx)):
-      if curr_frame*HOP_LENGTH <= len(waveforms[i]):res.extend(arr[np.where(arr == start_tokens[-1])[0][0]+1:eoti[0] if len (eoti:=np.where(arr == eot)[0]) else None])
-    ctx = [[enc._special_tokens['<|startofprev|>']]+gettexttoks(cs)+start_tokens for cs in ctx]
+      if curr_frame*HOP_LENGTH <= len(waveforms[i]):
+        res.extend(arr[np.where(arr == start_tokens[-1])[0][0]+1:eoti[0] if len (eoti:=np.where(arr == eot)[0]) else None])
+    ctx = [[enc._special_tokens["<|startofprev|>"]]+gettexttoks(cs)+start_tokens for cs in ctx]
 
   transcriptions = list(map(lambda tokens: enc.decode(tokens).strip(), transcriptions))
   return transcriptions if len(transcriptions) > 1 else transcriptions[0]
@@ -321,7 +391,8 @@ if __name__ == "__main__":
         log_spec = prep_audio(total.reshape(1, -1), model.batch_size, truncate=True)
         encoded_audio = model.encoder.encode(Tensor(log_spec))
       # pass the previously inferred tokens as 'prefix' - https://github.com/openai/whisper/discussions/117#discussioncomment-3727051
-      out = model.decoder(Tensor([lst]), 0, encoded_audio, streaming=True).realize()
+      # TODO: fix streaming=True
+      out = model.decoder(Tensor([lst]), 0, encoded_audio).realize() #, streaming=True).realize()
       idx = int(out[0,-1].argmax().numpy().item())
       lst.append(idx)
       dec = enc.decode(lst)
