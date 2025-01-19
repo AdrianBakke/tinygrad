@@ -114,6 +114,93 @@ class LLVMRenderer(Renderer):
     for u in uops:
       # hack for defining sqrt function (TODO: can we get a transcendental for this?)
       if u.op is Ops.SQRT: end_lines[f'declare {ldt(u.dtype)} @llvm.sqrt.{ldt(u.dtype)}({ldt(u.dtype)} %".1")'] = None
+      if u.op in (Ops.DEFINE_GLOBAL, Ops.DEFINE_VAR):
+        r[u] = f"%data{u.arg}" if u.op is Ops.DEFINE_GLOBAL else f"%{u.arg[0]}"
+        args.append(f"{ldt(u.dtype)}{' noalias' if isinstance(u.dtype, PtrDType) else ''} {r[u]}")
+      elif u.op is Ops.ASSIGN: pass  # assign is already handled by the first pass
+      elif u.op is Ops.DEFINE_ACC: r[u] = r[u.src[0]]  # a define acc can be used and never be assigned to
+      elif u.op is Ops.CONST: r[u] = lconst(u.arg, u.dtype)
+      elif u.op is Ops.CAST and ldt(u.dtype) == ldt(u.src[0].dtype): r[u] = r[u.src[0]] # cast from signed to unsigned of the same size is a noop
+      else:
+        # if it's an assign target, it's already preallocated
+        if u not in r:
+          vc += 1
+          r[u] = f"%v{vc}"
+
+        # do the rendering of the llvm ir code
+        if (l:=llvm_rewrite.rewrite(u, ctx=r)) is None: raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
+        kernel.append(cast(str, l))
+
+        # generate the phi nodes for the assigns
+        if u.op is Ops.RANGE:
+          for x in acc_to_assign:
+            if u in x.src:  # if this range is relevant for this acc
+              vc += 1
+              kernel.append(f"  %acc{vc} = phi {ldt(x.dtype)}" f"[{r[x]}, %loop_entry_{u.arg}], [{r[acc_to_assign[x]]}, %loop_latch_{u.arg}]")
+              r[x] = f"%acc{vc}"
+
+    # output the function
+    return f"define void @{name}({','.join(args)}) {{\n" + '\n'.join(kernel) + "\n  ret void\n}\n"+'\n'.join(end_lines.keys())
+
+
+
+# To move `llvm_bf16_cast` into the rewrite rules of the renderer, you can integrate its logic directly into the `extra_matcher` of the `LLVMRenderer` class. This way, the cast logic for bfloat16 will be handled as part of the pattern matching and transformation process. Here's how you can do it:
+#
+# 1. **Replace the standalone function**: Remove the `llvm_bf16_cast` function from the code.
+#
+# 2. **Integrate the logic**: Add a pattern in the `extra_matcher` that matches the specific case of casting a bfloat16 load and applies the transformation.
+#
+# Here is how you can modify the `LLVMRenderer` class by integrating `llvm_bf16_cast` logic:
+
+class LLVMRenderer(Renderer):
+  device = "LLVM"
+  supports_float4 = False
+  has_local = False
+  has_shared = False
+  global_max = None
+
+  extra_matcher = PatternMatcher([
+    # rewrite RECIP with FDIV
+    (UPat(Ops.RECIP, name="x"), lambda x: UOp(Ops.FDIV, x.dtype, (x.const_like(1), x.src[0]))),
+    # rewrite cast to bool to CMPNE 0
+    (UPat(Ops.CAST, dtype=dtypes.bool, name="x"), lambda x: x.src[0] != x.src[0].const_like(0)),
+    # rewrite MAX to CMPLT + WHERE
+    (UPat(Ops.MAX, name="m"), lambda m: (m.src[0] < m.src[1]).where(m.src[1], m.src[0])),
+    # rewrite bf16 CAST(LOAD) to CAST(BITCAST)
+    (UPat(Ops.CAST, name="root", src=(UPat.load(UPat.index(UPat.var("buf"), UPat.var("idx")), dtype=dtypes.bfloat16),)),
+     lambda root, buf, idx: UOp(Ops.CAST,
+                                UOp(Ops.BITCAST,
+                                    UOp(Ops.MUL,
+                                        UOp(Ops.CAST,
+                                            UOp(Ops.LOAD,
+                                                UOp(Ops.INDEX,
+                                                    buf.replace(dtype=dtypes.ushort.ptr(size=cast(PtrDType, buf.dtype).size)), idx),
+                                                dtype=dtypes.ushort),
+                                            dtype=dtypes.uint),
+                                        1 << 16),
+                                    dtype=dtypes.float32),
+                                dtype=root.dtype)),
+  ])
+
+  def render(self, name: str, uops: list[UOp]) -> str:
+    r: dict[UOp, str] = {}
+    args: list[str] = []
+    kernel: list[str] = []
+    end_lines: dict[str, None] = {}
+    vc = -1
+
+    # prealloc all assigns
+    acc_to_assign: dict[UOp, UOp] = {}
+    for u in uops:
+      if u.op is Ops.ASSIGN:
+        vc += 1
+        r[u] = r[u.src[1]] = f"%assign{vc}"
+        assert u.src[0] not in acc_to_assign, "can't assign to DEFINE_ACC twice"
+        acc_to_assign[u.src[0]] = u.src[1]
+
+    for u in uops:
+      # hack for defining sqrt function (TODO: can we get a transcendental for this?)
+      if u.op is Ops.SQRT: end_lines[f'declare {ldt(u.dtype)} @llvm.sqrt.{ldt(u.dtype)}({ldt(u.dtype)} %".1")'] = None
 
       if u.op in (Ops.DEFINE_GLOBAL, Ops.DEFINE_VAR):
         r[u] = f"%data{u.arg}" if u.op is Ops.DEFINE_GLOBAL else f"%{u.arg[0]}"
